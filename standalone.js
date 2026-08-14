@@ -12,23 +12,19 @@ if (!input) {
   process.exit(1);
 }
 
-let payload = "";
-if (input.toLowerCase().startsWith("http://ha.mr")) {
-  payload = input.slice(12);
-} else if (input.toLowerCase().startsWith("https://ha.mr")) {
-  payload = input.slice(13);
-} else if (input.toLowerCase().startsWith("ha.mr")) {
-  payload = input.slice(5);
-}
-
-if (payload) {
-  const isQRCode = input[0] === "/";
-  payload = payload.slice(1);
-  const useEmoji = Array.from(payload).some(c => !outputAlphabetASCII.includes(c));
-  if (isQRCode) console.log(decompress(payload, outputAlphabetQR));
-  else console.log(decompress(payload, useEmoji ? outputAlphabetEmoji : outputAlphabetASCII));
-  process.exit(0);
-}
+try {
+  const url = new URL(input.includes("://") ? input : "http://" + input);
+  if (url.hash.length > 1) {
+    const payload = decodeURIComponent(url.hash.slice(1));
+    const useEmoji = Array.from(payload).some(c => !outputAlphabetASCII.includes(c));
+    console.log(decompress(payload, useEmoji ? outputAlphabetEmoji : outputAlphabetASCII));
+    process.exit(0);
+  }
+  if (url.pathname.length > 1 && !url.search) {
+    console.log(decompress(decodeURIComponent(url.pathname.slice(1)), outputAlphabetQR));
+    process.exit(0);
+  }
+} catch {}
 
 let alphabet = outputAlphabetASCII;
 if (alphabetName === "qr") alphabet = outputAlphabetQR;

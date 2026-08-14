@@ -1,7 +1,10 @@
 /**
  * @file Implements link compression/decompression.
  */
-const VERSION = 0;
+import { SEGMENT_TOKENS, FILE_EXTENSIONS } from "./tokens.js";
+
+const VERSION_V0 = 0;
+const VERSION_V1 = 1;
 
 // Growing subcategories of the full URL alphabet
 // Each also includes the hyphen and underscore as common separators
@@ -151,16 +154,182 @@ function huffmanDecode (number, lookup) {
   return { newNumber: number, digit: lookup[sequence] };
 }
 
-/**
- * Compresses the input link and encodes it to the given alphabet.
- * @param {string} input Link to compress
- * @param {string[]} alphabet Output alphabet as array of characters/strings
- * @returns {string} Output payload (not a full link!)
- */
-export function compress (input, alphabet) {
-  let number = 1n;
+const VARIANT_COUNT_V0 = BigInt(subalphabets.length + 1);
+const VARIANT_COUNT_V1 = VARIANT_COUNT_V0 + 5n;
+const VARIANT_TOKEN = VARIANT_COUNT_V0;
+const VARIANT_DECIMAL = VARIANT_COUNT_V0 + 1n;
+const VARIANT_HEX = VARIANT_COUNT_V0 + 2n;
+const VARIANT_SLUG = VARIANT_COUNT_V0 + 3n;
+const VARIANT_UUID = VARIANT_COUNT_V0 + 4n;
+const SLUG_SEPARATORS = "-_.";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-  // Validate URL, add protocol if needed
+function encodeHuffmanSegment (base, value, firstIteration, variantCount) {
+  let huffmanNumber = firstIteration ? base : huffmanEncode(base, pathEncode["#"]);
+  for (let i = value.length - 1; i >= 0; i--) {
+    if (value[i - 2] === "%") {
+      const byte = parseInt(value.slice(i - 1, i + 1), 16);
+      huffmanNumber *= 256n;
+      huffmanNumber += BigInt(byte);
+      huffmanNumber = huffmanEncode(huffmanNumber, pathEncode["%"]);
+      i -= 2;
+    } else {
+      const code = pathEncode[value[i]];
+      if (code === undefined) return null;
+      huffmanNumber = huffmanEncode(huffmanNumber, code);
+    }
+  }
+  return huffmanNumber * variantCount;
+}
+
+function encodeSubalphabetSegment (base, value, firstIteration, variantCount) {
+  let subalphabetIndex = subalphabets.length - 1;
+  let subalphabet = subalphabets[subalphabetIndex];
+  for (let i = 0; i < subalphabets.length - 1; i++) {
+    if (!Array.from(value).some(c => !subalphabets[i].includes(c))) {
+      subalphabet = subalphabets[i];
+      subalphabetIndex = i;
+      break;
+    }
+  }
+  const subalphabetLength = BigInt(subalphabet.length + 1);
+  let n = firstIteration ? base : base * subalphabetLength;
+  for (let i = value.length - 1; i >= 0; i--) {
+    const idx = subalphabet.indexOf(value[i]);
+    if (idx < 0) return null;
+    n = n * subalphabetLength + BigInt(idx + 1);
+  }
+  return n * variantCount + BigInt(subalphabetIndex + 1);
+}
+
+function encodeSegment (base, value, firstIteration, version) {
+  const variantCount = version >= 1 ? VARIANT_COUNT_V1 : VARIANT_COUNT_V0;
+  const candidates = [
+    encodeHuffmanSegment(base, value, firstIteration, variantCount),
+    encodeSubalphabetSegment(base, value, firstIteration, variantCount)
+  ];
+  if (version >= 1) {
+    const token = SEGMENT_TOKENS.indexOf(value);
+    if (token >= 0) {
+      candidates.push((base * BigInt(SEGMENT_TOKENS.length) + BigInt(token)) * variantCount + VARIANT_TOKEN);
+    }
+    if (/^\d{1,63}$/.test(value)) {
+      let n = base * (10n ** BigInt(value.length)) + BigInt(value);
+      candidates.push((n * 64n + BigInt(value.length)) * variantCount + VARIANT_DECIMAL);
+    }
+    if (/^[0-9a-fA-F]{2,63}$/.test(value) && (value === value.toLowerCase() || value === value.toUpperCase())) {
+      let n = base * (16n ** BigInt(value.length)) + BigInt("0x" + value);
+      n = n * 64n + BigInt(value.length);
+      n <<= 1n;
+      if (value !== value.toLowerCase()) n += 1n;
+      candidates.push(n * variantCount + VARIANT_HEX);
+    }
+    const sep = slugSeparator(value);
+    if (sep) {
+      const parts = value.split(sep);
+      if (parts.length >= 2 && parts.length <= 15) {
+        let n = base;
+        for (let i = parts.length - 1; i >= 0; i--) {
+          n = encodeSegment(n, parts[i], false, version);
+          if (n === null) break;
+        }
+        if (n !== null) {
+          n = n * 3n + BigInt(SLUG_SEPARATORS.indexOf(sep));
+          n = n * 16n + BigInt(parts.length);
+          candidates.push(n * variantCount + VARIANT_SLUG);
+        }
+      }
+    }
+    if (UUID_RE.test(value)) {
+      let n = base * (1n << 128n) + BigInt("0x" + value.replaceAll("-", ""));
+      n <<= 1n;
+      if (value !== value.toLowerCase()) n += 1n;
+      candidates.push(n * variantCount + VARIANT_UUID);
+    }
+  }
+  return candidates.reduce((best, n) => n != null && (best === null || n < best) ? n : best, null);
+}
+
+function slugSeparator (value) {
+  const seps = [...SLUG_SEPARATORS].filter(sep => value.includes(sep));
+  if (seps.length !== 1) return "";
+  if (!/^[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)+$/.test(value)) return "";
+  return seps[0];
+}
+
+function decodeSegmentValue (number, variantCount, version, stopHuffmanOnHash) {
+  const variant = Number(number % variantCount);
+  number /= variantCount;
+  let text = "";
+
+  if (variant === 0) {
+    while (number > 1n) {
+      const { newNumber, digit } = huffmanDecode(number, pathDecode);
+      number = newNumber;
+      if (digit === "#" && stopHuffmanOnHash) break;
+      text += digit;
+      if (digit === "%") {
+        const byte = number % 256n;
+        text += byte.toString(16).padStart(2, "0");
+        number /= 256n;
+      }
+    }
+  } else if (variant === Number(VARIANT_TOKEN) && version >= 1) {
+    const idx = Number(number % BigInt(SEGMENT_TOKENS.length));
+    number /= BigInt(SEGMENT_TOKENS.length);
+    text = SEGMENT_TOKENS[idx];
+  } else if (variant === Number(VARIANT_DECIMAL) && version >= 1) {
+    const len = Number(number % 64n);
+    number /= 64n;
+    const radix = 10n ** BigInt(len);
+    const value = number % radix;
+    number /= radix;
+    text = value.toString(10).padStart(len, "0");
+  } else if (variant === Number(VARIANT_HEX) && version >= 1) {
+    const upper = number & 1n;
+    number >>= 1n;
+    const len = Number(number % 64n);
+    number /= 64n;
+    const radix = 16n ** BigInt(len);
+    const value = number % radix;
+    number /= radix;
+    text = value.toString(16).padStart(len, "0");
+    if (upper) text = text.toUpperCase();
+  } else if (variant === Number(VARIANT_SLUG) && version >= 1) {
+    const partCount = Number(number % 16n);
+    number /= 16n;
+    const sep = SLUG_SEPARATORS[Number(number % 3n)];
+    number /= 3n;
+    const parts = [];
+    for (let i = 0; i < partCount; i++) {
+      const part = decodeSegmentValue(number, variantCount, version, true);
+      number = part.number;
+      parts.push(part.text);
+    }
+    text = parts.join(sep);
+  } else if (variant === Number(VARIANT_UUID) && version >= 1) {
+    const upper = number & 1n;
+    number >>= 1n;
+    const value = number % (1n << 128n);
+    number /= (1n << 128n);
+    let hex = value.toString(16).padStart(32, "0");
+    if (upper) hex = hex.toUpperCase();
+    text = hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
+  } else {
+    const subalphabet = subalphabets[variant - 1];
+    const subalphabetLength = BigInt(subalphabet.length + 1);
+    while (number > 1n) {
+      const index = Number(number % subalphabetLength);
+      number /= subalphabetLength;
+      if (index === 0) break;
+      text += subalphabet[index - 1];
+    }
+  }
+
+  return { number, text };
+}
+
+function parseLink (input, version) {
   let url;
   if (URL.canParse(input)) {
     url = new URL(input);
@@ -169,7 +338,7 @@ export function compress (input, alphabet) {
   }
 
   let hostname = url.hostname.toLowerCase();
-  const port = BigInt(url.port);
+  const port = url.port ? BigInt(url.port) : 0n;
   const tld = hostname.includes(".") && hostname.split(".").at(-1).toLowerCase();
 
   if (tld in tldEncode) {
@@ -183,112 +352,99 @@ export function compress (input, alphabet) {
   const knownSLD = sldList.find(c => hostname.endsWith(c)) || "";
   const subdomain = hostname.slice(0, -knownSLD.length);
 
-  // Read URL path, split it into segments
   let path = url.pathname;
-
-  // Remove "index" suffixes, encoded separately later
   const hasIndexHTML = path.endsWith("/index.html");
   const hasIndexPHP = path.endsWith("/index.php");
   if (hasIndexHTML) path = path.slice(0, -11);
   else if (hasIndexPHP) path = path.slice(0, -10);
 
-  // The seperable parts of a path/query are split into segments with
-  // their position/role in the link noted. This lets us pick optimal
-  // character sets for individual segments and enables us to encode
-  // only the transitions between segments. As-is, the system's a bit
-  // clumsy, but it works.
+  let hasTrailingSlash = false;
+  let fileExtension = 0;
+  if (version >= 1) {
+    hasTrailingSlash = path.endsWith("/") && path.length > 1;
+    if (hasTrailingSlash) path = path.slice(0, -1);
+    const lastSlash = path.lastIndexOf("/");
+    const lastSeg = path.slice(lastSlash + 1);
+    const dot = lastSeg.lastIndexOf(".");
+    if (dot > 0) {
+      const ext = lastSeg.slice(dot + 1).toLowerCase();
+      const extIdx = FILE_EXTENSIONS.indexOf(ext);
+      if (extIdx >= 0) {
+        fileExtension = extIdx + 1;
+        path = path.slice(0, path.length - ext.length - 1);
+      }
+    }
+  }
+
   const pathSegments = path.split("/")
     .filter(c => c.length)
     .map(c => ({ type: "path", value: c }));
 
-  // Add search/query parameters to path segments
-  let queryParams = Array.from(url.searchParams)
+  const queryParams = Array.from(url.searchParams)
     .flat()
     .map(c => ({ type: "query", value: c }));
   pathSegments.push(...queryParams);
 
-  // Add hash value to path segments
   if (url.hash && url.hash.length > 1) {
     pathSegments.push({ type: "hash", value: url.hash.slice(1) });
   }
 
-  // Normalize path segment encoding
   for (const segment of pathSegments) {
     segment.value = encodeURI(decodeURI(segment.value));
   }
 
-  // Encode path following domain segment-by-segment, using best algorithm for each
+  return {
+    hostname,
+    port,
+    tld,
+    isHTTPS,
+    hasWWW,
+    knownSLD,
+    subdomain,
+    hasIndexHTML,
+    hasIndexPHP,
+    hasTrailingSlash,
+    fileExtension,
+    pathSegments
+  };
+}
+
+function compressToNumber (input, version) {
+  const parsed = parseLink(input, version);
+  const {
+    hostname, port, tld, isHTTPS, hasWWW, knownSLD, subdomain,
+    hasIndexHTML, hasIndexPHP, hasTrailingSlash, fileExtension, pathSegments
+  } = parsed;
+
+  let number = 1n;
   let lastSegmentType = pathSegments.at(-1)?.type;
   let queryParamIndex = 0;
-  for (let j = pathSegments.length - 1; j >= 0; j --) {
+  for (let j = pathSegments.length - 1; j >= 0; j--) {
     const segment = pathSegments[j];
     const firstIteration = j === pathSegments.length - 1;
     if (!firstIteration && queryParamIndex % 2 !== 1) {
-      // Indicate change of segment type (path -> param -> hash)
-      //   First bit indicates that a change is happening,
-      //   second bit indicates whether we're skipping straight to the hash.
       number <<= 1n;
       if (lastSegmentType === "hash" && segment.type === "query") {
-        number ++;
+        number++;
       } else if (lastSegmentType === "hash" && segment.type === "path") {
-        number ++; // Second bit is 1
+        number++;
         number <<= 1n;
-        number ++;
+        number++;
       } else if (lastSegmentType !== segment.type) {
-        // Second bit is 0
         number <<= 1n;
-        number ++;
+        number++;
       }
       lastSegmentType = segment.type;
     }
     if (segment.type === "query") {
-      queryParamIndex ++;
+      queryParamIndex++;
     }
-    // Look for smallest subalphabet that fits this path segment
-    let subalphabetIndex = subalphabets.length - 1;
-    let subalphabet = subalphabets[subalphabetIndex];
-    for (let i = 0; i < subalphabets.length - 1; i ++) {
-      if (!Array.from(segment.value).some(c => !subalphabets[i].includes(c))) {
-        subalphabet = subalphabets[i];
-        subalphabetIndex = i;
-        break;
-      }
-    }
-    // Compute number after Huffman coding
-    let huffmanNumber = firstIteration ? number : huffmanEncode(number, pathEncode["#"]);
-    for (let i = segment.value.length - 1; i >= 0; i --) {
-      if (segment.value[i - 2] === "%") {
-        const byte = parseInt(segment.value.slice(i - 1, i + 1), 16);
-        huffmanNumber *= 256n;
-        huffmanNumber += BigInt(byte);
-        huffmanNumber = huffmanEncode(huffmanNumber, pathEncode["%"]);
-        i -= 2;
-      } else {
-        huffmanNumber = huffmanEncode(huffmanNumber, pathEncode[segment.value[i]]);
-      }
-    }
-    // Encode segment variant as 0
-    // (We're adding +1 here to introduce 0 as a special value indicating Huffman)
-    huffmanNumber *= BigInt(subalphabets.length + 1);
-    // Compute number after encoding with chosen subalphabet
-    const subalphabetLength = BigInt(subalphabet.length + 1);
-    let subalphabetNumber = firstIteration ? number : number * subalphabetLength;
-    for (let i = segment.value.length - 1; i >= 0; i--) {
-      subalphabetNumber *= subalphabetLength;
-      subalphabetNumber += BigInt(subalphabet.indexOf(segment.value[i]) + 1);
-    }
-    // Encode segment variant as subalphabet index + 1
-    subalphabetNumber *= BigInt(subalphabets.length + 1);
-    subalphabetNumber += BigInt(subalphabetIndex + 1);
-    // Compare candidate numbers, pick smallest one
-    if (huffmanNumber < subalphabetNumber) {
-      number = huffmanNumber;
-    } else {
-      number = subalphabetNumber;
+    number = encodeSegment(number, segment.value, firstIteration, version);
+    if (number === null) {
+      throw `Unable to encode segment: "${segment.value}"`;
     }
   }
 
-  // Encode type of first path segment
   if (pathSegments.length > 0) {
     number *= 3n;
     if (pathSegments[0].type === "query") {
@@ -298,27 +454,16 @@ export function compress (input, alphabet) {
     }
   }
 
-  // Encode either SLD + subdomain or full hostname
-  if (!knownSLD) {
-    // Write stopping token only if path follows
-    if (path || search) number = huffmanEncode(number, domainEncode["END"]);
-    for (let i = hostname.length - 1; i >= 0; i --) {
-      number = huffmanEncode(number, domainEncode[hostname[i]]);
+  const hasRemainder = pathSegments.length > 0;
+  const hostPart = knownSLD ? subdomain : hostname;
+  if (hostPart) {
+    if (hasRemainder) number = huffmanEncode(number, domainEncode["END"]);
+    for (let i = hostPart.length - 1; i >= 0; i--) {
+      number = huffmanEncode(number, domainEncode[hostPart[i]]);
     }
-  } else {
-    // Encode subdomain
-    if (subdomain) {
-      // Write stopping token only if path follows
-      if (path || search) number = huffmanEncode(number, domainEncode["END"]);
-      for (let i = subdomain.length - 1; i >= 0; i--) {
-        number = huffmanEncode(number, domainEncode[subdomain[i]]);
-      }
-    }
-    // Encode Huffman code of known SLD
-    number = huffmanEncode(number, sldEncode[knownSLD]);
   }
+  if (knownSLD) number = huffmanEncode(number, sldEncode[knownSLD]);
 
-  // Indicate presence of known SLD and optional subdomain
   if (knownSLD) {
     number <<= 1n;
     if (subdomain) number += 1n;
@@ -326,22 +471,28 @@ export function compress (input, alphabet) {
   number <<= 1n;
   if (knownSLD) number += 1n;
 
-  // Encode "index.html"/"index.php" suffix
+  if (version >= 1) {
+    number <<= 1n;
+    if (hasTrailingSlash) number += 1n;
+    if (fileExtension) {
+      number *= 16n;
+      number += BigInt(fileExtension - 1);
+    }
+    number <<= 1n;
+    if (fileExtension) number += 1n;
+  }
+
   number <<= 1n;
   if (hasIndexPHP) number += 1n;
   if (hasIndexHTML || hasIndexPHP) {
     number <<= 1n;
     number += 1n;
   }
-  // Encode protocol
   number <<= 1n;
   if (isHTTPS) number += 1n;
-  // Encode "www." prefix
   number <<= 1n;
   if (hasWWW) number += 1n;
-  // Encode TLD
   number = huffmanEncode(number, tldEncode[tld] || tldEncode[""]);
-  // Encode port number
   if (port) {
     number *= 65536n;
     number += port;
@@ -349,14 +500,56 @@ export function compress (input, alphabet) {
   number <<= 1n;
   if (port) number += 1n;
 
-  // Encode version number
-  for (let i = 0; i < VERSION; i ++) {
+  number <<= 1n;
+  for (let i = 0; i < version; i++) {
     number <<= 1n;
     number += 1n;
   }
-  number <<= 1n;
+  return number;
+}
 
-  return numberToString(number, alphabet);
+function assembleUrl ({
+  isHTTPS, hasWWW, subdomain, domain, tld, hasPort, port,
+  path, indexSuffix, fileExtension, hasTrailingSlash
+}) {
+  let pathPart = path;
+  let queryHash = "";
+  const q = pathPart.indexOf("?");
+  const h = pathPart.indexOf("#");
+  let cut = -1;
+  if (q >= 0 && h >= 0) cut = Math.min(q, h);
+  else if (q >= 0) cut = q;
+  else if (h >= 0) cut = h;
+  if (cut >= 0) {
+    queryHash = pathPart.slice(cut);
+    pathPart = pathPart.slice(0, cut);
+  }
+  if (fileExtension) pathPart += "." + fileExtension;
+  if (indexSuffix) pathPart += indexSuffix;
+  if (hasTrailingSlash && !pathPart.endsWith("/")) {
+    pathPart += "/";
+  }
+  return ""
+    + (isHTTPS ? "https://" : "http://")
+    + (hasWWW ? "www." : "")
+    + subdomain
+    + domain
+    + (tld ? "." + tld : "")
+    + (hasPort ? ":" + port : "")
+    + pathPart
+    + queryHash;
+}
+
+/**
+ * Compresses the input link and encodes it to the given alphabet.
+ * @param {string} input Link to compress
+ * @param {string[]} alphabet Output alphabet as array of characters/strings
+ * @returns {string} Output payload (not a full link!)
+ */
+export function compress (input, alphabet) {
+  const v0 = compressToNumber(input, VERSION_V0);
+  const v1 = compressToNumber(input, VERSION_V1);
+  return numberToString(v1 <= v0 ? v1 : v0, alphabet);
 }
 
 /**
@@ -369,15 +562,13 @@ export function compress (input, alphabet) {
 export function decompress (input, alphabet) {
   let number = stringToNumber(input, alphabet);
 
-  // Version number - currently unused
   let version = 0;
   while (number & 1n) {
-    version ++;
+    version++;
     number >>= 1n;
   }
   number >>= 1n;
 
-  // Decode port number
   const hasPort = number & 1n;
   number >>= 1n;
   let port;
@@ -385,17 +576,13 @@ export function decompress (input, alphabet) {
     port = number % 65536n;
     number /= 65536n;
   }
-  // Decode TLD
   const tldDecodeResult = huffmanDecode(number, tldDecode);
   number = tldDecodeResult.newNumber;
   const tld = tldDecodeResult.digit;
-  // Decode "www." prefix
   const hasWWW = number & 1n;
   number >>= 1n;
-  // Decode protocol
   const isHTTPS = number & 1n;
   number >>= 1n;
-  // Decode "index.html"/"index.php" suffix
   let indexSuffix = "";
   if (number & 1n) {
     number >>= 1n;
@@ -406,12 +593,27 @@ export function decompress (input, alphabet) {
     }
   }
   number >>= 1n;
-  // Determine domain format
+
+  let fileExtension = "";
+  let hasTrailingSlash = false;
+  if (version >= 1) {
+    if (number & 1n) {
+      number >>= 1n;
+      const extIdx = Number(number % 16n);
+      number /= 16n;
+      fileExtension = FILE_EXTENSIONS[extIdx] || "";
+    } else {
+      number >>= 1n;
+    }
+    hasTrailingSlash = Boolean(number & 1n);
+    number >>= 1n;
+  }
+
   const hasKnownSLD = number & 1n;
   number >>= 1n;
   let hasSubdomain = false;
   if (hasKnownSLD) {
-    hasSubdomain = number & 1n;
+    hasSubdomain = Boolean(number & 1n);
     number >>= 1n;
   }
 
@@ -440,10 +642,10 @@ export function decompress (input, alphabet) {
     }
   }
 
+  const variantCount = version >= 1 ? VARIANT_COUNT_V1 : VARIANT_COUNT_V0;
   const segmentTypeIndex = number % 3n;
   number /= 3n;
-  let currentSegmentType = ["path", "query", "hash"][segmentTypeIndex];
-
+  let currentSegmentType = ["path", "query", "hash"][Number(segmentTypeIndex)];
   let queryParamIndex = 0;
 
   while (number > 1n) {
@@ -459,42 +661,18 @@ export function decompress (input, alphabet) {
       } else {
         path += "&";
       }
-      queryParamIndex ++;
+      queryParamIndex++;
     }
-    // Get path segment variant
-    const variant = Number(number % BigInt(subalphabets.length + 1));
-    number /= BigInt(subalphabets.length + 1);
-    // Variant 0 is Huffman code, rest are subalphabets
-    if (variant === 0) {
-      while (number > 1n) {
-        const { newNumber, digit } = huffmanDecode(number, pathDecode);
-        number = newNumber;
-        if (digit === "#" && currentSegmentType !== "hash") break;
-        path += digit;
-        if (digit === "%") {
-          const byte = number % 256n;
-          path += byte.toString(16);
-          number /= 256n;
-        }
-      }
-    } else {
-      const subalphabet = subalphabets[variant - 1];
-      const subalphabetLength = BigInt(subalphabet.length + 1);
-      while (number > 1n) {
-        const index = Number(number % subalphabetLength);
-        number /= subalphabetLength;
-        if (index === 0) break;
-        path += subalphabet[index - 1];
-      }
-    }
-    // Handle changing between path segment types, unless we're in the
-    // middle of decoding a query parameter key/value pair, in which
-    // case switching to the hash value doesn't make sense.
+
+    const decoded = decodeSegmentValue(number, variantCount, version, currentSegmentType !== "hash");
+    number = decoded.number;
+    path += decoded.text;
+
     if (queryParamIndex % 2) continue;
-    if (number & 1n) { // Changing segment type?
+    if (number & 1n) {
       if (currentSegmentType === "path") {
         number >>= 1n;
-        if (number & 1n) { // Skipping to hash?
+        if (number & 1n) {
           currentSegmentType = "hash";
         } else {
           currentSegmentType = "query";
@@ -506,15 +684,17 @@ export function decompress (input, alphabet) {
     number >>= 1n;
   }
 
-  let output = ""
-    + (isHTTPS ? "https://" : "http://")
-    + (hasWWW ? "www." : "")
-    + subdomain
-    + domain
-    + (tld ? "." + tld : "")
-    + (hasPort ? ":" + port : "")
-    + path
-    + indexSuffix;
-
-  return output;
+  return assembleUrl({
+    isHTTPS,
+    hasWWW,
+    subdomain,
+    domain,
+    tld,
+    hasPort,
+    port,
+    path,
+    indexSuffix,
+    fileExtension,
+    hasTrailingSlash
+  });
 }
